@@ -1,152 +1,183 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const moment = require('moment-timezone');
-const colors = require('colors');
-const fs = require('fs');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    DisconnectReason,
+    makeInMemoryStore
+} = require("@whiskeysockets/baileys");
 
-const client = new Client({
-    restartOnAuthFail: true,
-    puppeteer: {
-        headless: true,
-        args: [ '--no-sandbox', '--disable-setuid-sandbox' ]
-    },
-    webVersionCache: { 
-        type: 'remote', 
-        remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
-    },
-    ffmpeg: './ffmpeg.exe',
-    authStrategy: new LocalAuth({ clientId: "client" })
-});
-const config = require('./config/config.json');
+const P = require("pino");
+const readline = require("readline");
+const fs = require("fs");
+const axios = require("axios");
+const Boom = require("@hapi/boom").Boom;
 
-client.on('qr', (qr) => {
-    console.log(`[${moment().tz(config.timezone).format('HH:mm:ss')}] Scan the QR below : `);
-    qrcode.generate(qr, { small: true });
-});
+const usePairingCode = true;
+const store = makeInMemoryStore({ logger: P({ level: 'silent' }) });
 
-client.on('ready', () => {
-    console.clear();
-    const consoleText = './config/console.txt';
-    fs.readFile(consoleText, 'utf-8', (err, data) => {
-        if (err) {
-            console.log(`[${moment().tz(config.timezone).format('HH:mm:ss')}] Console Text not found!`.yellow);
-            console.log(`[${moment().tz(config.timezone).format('HH:mm:ss')}] ${config.name} is Already!`.green);
-        } else {
-            console.log(data.green);
-            console.log(`[${moment().tz(config.timezone).format('HH:mm:ss')}] ${config.name} is Already!`.green);
+const question = (text) => {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    return new Promise((resolve) => {
+        rl.question(text, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
+};
+
+async function waitForConnection(sock) {
+    return new Promise((resolve) => {
+        sock.ev.on('connection.update', (update) => {
+            const { connection } = update;
+            if (connection === 'open') {
+                resolve();
+            }
+        });
+    });
+}
+
+const sendMessageSafely = async (sock, to, message, retries = 3) => {
+    if (sock.authState && sock.authState.creds && sock.authState.creds.registered) {
+        try {
+            await sock.sendMessage(to, message);
+        } catch (error) {
+            console.error('Error sending message:', error);
+            if (error.output?.statusCode === 408 && retries > 0) {
+                console.log(`Retrying to send message... (${retries} retries left)`);
+                await new Promise(resolve => setTimeout(resolve, 2000)); // Delay of 2 seconds
+                await sendMessageSafely(sock, to, message, retries - 1);
+            } else {
+                console.log('Failed to send message after retries.');
+            }
+        }
+    } else {
+        console.log('Cannot send message, connection not open.');
+    }
+};
+
+async function startSession() {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+
+    console.log(`Baileys version: ${version}, is latest: ${isLatest}`);
+
+    const sock = makeWASocket({
+        version,
+        printQRInTerminal: !usePairingCode,
+        auth: state,
+        logger: P({ level: 'fatal' })
+    });
+    store.bind(sock.ev);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'close') {
+            const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+            console.log('Connection closed:', lastDisconnect.error);
+            handleDisconnectReason(reason, sock);
+        } else if (connection === 'connecting') {
+            console.log('Connecting...');
+        } else if (connection === 'open') {
+            console.log('Connected');
         }
     });
-});
 
-client.on('message', async (message) => {
-    const isGroups = message.from.endsWith('@g.us') ? true : false;
-    if ((isGroups && config.groups) || !isGroups) {
+    if (usePairingCode && !sock.authState.creds.registered) {
+        const phoneNumber = await question('Masukkan nomor yang aktif tanpa +, - dan spasi:\n');
+        const code = await sock.requestPairingCode(phoneNumber.trim());
+        console.log(`Generated pairing code: ${code}`);
+    }
 
-        // Image to Sticker (Auto && Caption)
-        if ((message.type == "image" || message.type == "video" || message.type  == "gif") || (message._data.caption == `${config.prefix}sticker`)) {
-            if (config.log) console.log(`[${'!'.red}] ${message.from.replace("@c.us", "").yellow} created sticker`);
-            client.sendMessage(message.from, "*[⏳]* Loading..");
+    await waitForConnection(sock);
+
+    const initialPhoneNumber = '62081334175090@s.whatsapp.com';
+    await sendMessageSafely(sock, initialPhoneNumber, { text: 'Script is running.' });
+
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        const msg = chatUpdate.messages[0];
+        if (!msg.message) return;
+
+        const message = (msg.message.ephemeralMessage)
+            ? msg.message.ephemeralMessage.message
+            : msg.message;
+
+        if (msg.key.remoteJid === 'status@broadcast' || (msg.key.id.startsWith('BAE5') && msg.key.id.length === 16)) return;
+
+        await handleMessage(sock, msg);
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+}
+
+function handleDisconnectReason(reason, sock) {
+    switch (reason) {
+        case DisconnectReason.badSession:
+            console.log('Bad session file, please delete session and scan again.');
+            process.exit();
+        case DisconnectReason.connectionClosed:
+        case DisconnectReason.connectionLost:
+            console.log('Connection lost, trying to reconnect...');
+            startSession();
+            break;
+        case DisconnectReason.loggedOut:
+            console.log('Device logged out, please scan again.');
+            sock.logout();
+            break;
+        case DisconnectReason.restartRequired:
+            console.log('Restart required, restarting...');
+            startSession();
+            break;
+        default:
+            console.log('Disconnected for unknown reason, restarting...');
+            startSession();
+            break;
+    }
+}
+
+async function handleMessage(sock, msg) {
+    const from = msg.key.remoteJid;
+    let messageBody = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+    console.log('Received message:', messageBody);
+
+    if (messageBody) {
+        if (messageBody.startsWith('.ai')) {
+            console.log('AI command detected.');
+            const query = messageBody.slice(4).trim();
             try {
-                const media = await message.downloadMedia();
-                client.sendMessage(message.from, media, {
-                    sendMediaAsSticker: true,
-                    stickerName: config.name, // Sticker Name = Edit in 'config/config.json'
-                    stickerAuthor: config.author // Sticker Author = Edit in 'config/config.json'
-                }).then(() => {
-                    client.sendMessage(message.from, "*[✅]* Successfully!");
-                });
-            } catch {
-                client.sendMessage(message.from, "*[❎]* Failed!");
+                const response = await axios.post(
+                    'https://api.shx.my.id/api/whatsapp',
+                    { query: { message: query } },
+                    { headers: { 'Content-Type': 'application/json' }, auth: { username: 'admin', password: 'Wifi.id123' } }
+                );
+                const reply = response.data.replies[0]?.message || 'No response from the API.';
+                await sock.sendMessage(from, { text: reply });
+            } catch (error) {
+                console.error('Error processing request:', error);
+                await sock.sendMessage(from, { text: 'An error occurred while processing your request.' });
             }
-
-        // Image to Sticker (With Reply Image)
-        } else if (message.body == `${config.prefix}sticker`) {
-            if (config.log) console.log(`[${'!'.red}] ${message.from.replace("@c.us", "").yellow} created sticker`);
-            const quotedMsg = await message.getQuotedMessage(); 
-            if (message.hasQuotedMsg && quotedMsg.hasMedia) {
-                client.sendMessage(message.from, "*[⏳]* Loading..");
-                try {
-                    const media = await quotedMsg.downloadMedia();
-                    client.sendMessage(message.from, media, {
-                        sendMediaAsSticker: true,
-                        stickerName: config.name, // Sticker Name = Edit in 'config/config.json'
-                        stickerAuthor: config.author // Sticker Author = Edit in 'config/config.json'
-                    }).then(() => {
-                        client.sendMessage(message.from, "*[✅]* Successfully!");
-                    });
-                } catch {
-                    client.sendMessage(message.from, "*[❎]* Failed!");
-                }
-            } else {
-                client.sendMessage(message.from, "*[❎]* Reply Image First!");
-            }
-
-        // Sticker to Image (Auto)
-        } else if (message.type == "sticker") {
-            if (config.log) console.log(`[${'!'.red}] ${message.from.replace("@c.us", "").yellow} convert sticker into image`);
-            client.sendMessage(message.from, "*[⏳]* Loading..");
+        } else if (messageBody.startsWith('.menu')) {
+            console.log('Menu command detected.');
+            const imagePath = './image.jpg';
+            const menuText = 'Available commands:\n1. `.ai [query]` - Query the API\n2. `.menu` - Show this menu';
             try {
-                const media = await message.downloadMedia();
-                client.sendMessage(message.from, media).then(() => {
-                    client.sendMessage(message.from, "*[✅]* Successfully!");
-                });  
-            } catch {
-                client.sendMessage(message.from, "*[❎]* Failed!");
+                await sock.sendMessage(from, { image: fs.readFileSync(imagePath), caption: menuText });
+            } catch (error) {
+                console.error('Error sending menu image:', error);
+                await sock.sendMessage(from, { text: 'An error occurred while sending the menu image.' });
             }
-
-        // Sticker to Image (With Reply Sticker)
-        } else if (message.body == `${config.prefix}image`) {
-            if (config.log) console.log(`[${'!'.red}] ${message.from.replace("@c.us", "").yellow} convert sticker into image`);
-            const quotedMsg = await message.getQuotedMessage(); 
-            if (message.hasQuotedMsg && quotedMsg.hasMedia) {
-                client.sendMessage(message.from, "*[⏳]* Loading..");
-                try {
-                    const media = await quotedMsg.downloadMedia();
-                    client.sendMessage(message.from, media).then(() => {
-                        client.sendMessage(message.from, "*[✅]* Successfully!");
-                    });
-                } catch {
-                    client.sendMessage(message.from, "*[❎]* Failed!");
-                }
-            } else {
-                client.sendMessage(message.from, "*[❎]* Reply Sticker First!");
-            }
-
-        // Claim or change sticker name and sticker author
-        } else if (message.body.startsWith(`${config.prefix}change`)) {
-            if (config.log) console.log(`[${'!'.red}] ${message.from.replace("@c.us", "").yellow} change the author name on the sticker`);
-            if (message.body.includes('|')) {
-                let name = message.body.split('|')[0].replace(message.body.split(' ')[0], '').trim();
-                let author = message.body.split('|')[1].trim();
-                const quotedMsg = await message.getQuotedMessage(); 
-                if (message.hasQuotedMsg && quotedMsg.hasMedia) {
-                    client.sendMessage(message.from, "*[⏳]* Loading..");
-                    try {
-                        const media = await quotedMsg.downloadMedia();
-                        client.sendMessage(message.from, media, {
-                            sendMediaAsSticker: true,
-                            stickerName: name,
-                            stickerAuthor: author
-                        }).then(() => {
-                            client.sendMessage(message.from, "*[✅]* Successfully!");
-                        });
-                    } catch {
-                        client.sendMessage(message.from, "*[❎]* Failed!");
-                    }
-                } else {
-                    client.sendMessage(message.from, "*[❎]* Reply Sticker First!");
-                }
-            } else {
-                client.sendMessage(message.from, `*[❎]* Run the command :\n*${config.prefix}change <name> | <author>*`);
-            }
-        
-        // Read chat
         } else {
-            client.getChatById(message.id.remote).then(async (chat) => {
-                await chat.sendSeen();
-            });
+            console.log('No valid command detected.');
         }
     }
-});
+}
 
-client.initialize();
+startSession();
+
+process.on('uncaughtException', (err) => {
+    console.error('Caught exception:', err);
+});
